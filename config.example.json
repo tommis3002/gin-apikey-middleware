@@ -1,0 +1,25 @@
+{
+  "server": {
+    "port": 8080
+  },
+  "api_keys": {
+    "sk_live_admin_987654321": {
+      "id": "admin-user",
+      "name": "Internal Admin Console",
+      "roles": ["admin"],
+      "scopes": ["read", "write", "delete"]
+    },
+    "sk_live_client_123456789": {
+      "id": "mobile-app",
+      "name": "Customer Mobile App",
+      "roles": ["viewer"],
+      "scopes": ["read"],
+      "expires_at": "2027-01-01T00:00:00Z"
+    },
+    "sk_revoked_key_000000000": {
+      "id": "legacy-client",
+      "name": "Old Deprecated Service",
+      "disabled": true
+    }
+  }
+}
