@@ -73,9 +73,13 @@ func main() {
 		return cachedDBStore.Lookup(ctx, key)
 	})
 
-	// 3. Configure the middleware
+	// 3. Set up usage metering for invoicing
+	usageAggregator := apikey.NewMemoryUsageAggregator()
+
+	// 4. Configure the middleware
 	authMiddleware := apikey.New(apikey.Config{
-		Store: combinedStore,
+		Store:         combinedStore,
+		UsageRecorder: usageAggregator,
 		Extractor: apikey.FromFirstOf(
 			apikey.FromHeader("X-API-Key"),
 			apikey.FromBearer(),
@@ -110,6 +114,17 @@ func main() {
 				"metadata": info.Metadata,
 				"raw_key":  rawKey[:min(len(rawKey), 6)] + "...",
 			})
+		})
+
+		api.POST("/batch", func(c *gin.Context) {
+			// Example variable-cost endpoint charging 5 units
+			apikey.SetUsageUnits(c, 5)
+			apikey.SetUsageAttribute(c, "sku", "batch-processing")
+			c.JSON(http.StatusOK, gin.H{"billed_units": 5})
+		})
+
+		api.GET("/billing/usage", apikey.RequireRole("admin"), func(c *gin.Context) {
+			c.JSON(http.StatusOK, usageAggregator.Snapshot())
 		})
 
 		api.DELETE("/users/:id", apikey.RequireRole("admin"), func(c *gin.Context) {

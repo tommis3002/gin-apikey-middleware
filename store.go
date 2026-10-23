@@ -15,45 +15,72 @@ import (
 )
 
 const (
-	// DefaultCacheMaxEntries is the default maximum number of entries retained in CachedStore.
+	// DefaultCacheMaxEntries is the default maximum number of entries retained in
+	// [CachedStore] when [CachedStoreConfig.MaxEntries] is not specified (<= 0).
 	DefaultCacheMaxEntries = 10_000
 
-	// DefaultNegativeCacheTTL is the default maximum TTL used by CachedStore for negative lookups
-	// (such as ErrKeyNotFound, ErrKeyDisabled, and ErrKeyExpired).
+	// DefaultNegativeCacheTTL is the default upper bound for caching negative lookup
+	// results ([ErrKeyNotFound], [ErrKeyDisabled], and [ErrKeyExpired]) in [CachedStore].
 	DefaultNegativeCacheTTL = 30 * time.Second
 
 	evictionSampleSize = 64
 )
 
 var (
-	// ErrKeyNotFound is returned when the API key is not found in the store.
+	// ErrKeyNotFound indicates that the presented API key does not exist in the [Store].
 	ErrKeyNotFound = errors.New("api key not found")
 
-	// ErrKeyDisabled is returned when the API key is marked as disabled or revoked.
+	// ErrKeyDisabled indicates that the API key exists, has [KeyInfo.Disabled] set to
+	// true, and has been revoked or suspended.
 	ErrKeyDisabled = errors.New("api key is disabled")
 
-	// ErrKeyExpired is returned when the API key has expired.
+	// ErrKeyExpired indicates that the API key's [KeyInfo.ExpiresAt] timestamp is in the past.
 	ErrKeyExpired = errors.New("api key has expired")
 
-	// ErrInvalidKey is returned when the provided API key is invalid or malformed.
+	// ErrInvalidKey indicates that the API key or authorization header is malformed
+	// (for example, an unexpected authentication scheme prefix) or otherwise invalid.
 	ErrInvalidKey = errors.New("invalid api key")
 
-	// ErrMissingKey is returned when no API key was extracted from the request.
+	// ErrMissingKey indicates that no API key was found in the incoming HTTP request
+	// by the configured [Extractor].
 	ErrMissingKey = errors.New("missing api key")
 )
 
-// KeyInfo holds the metadata associated with an authenticated API key.
+// KeyInfo holds identity, authorization, and lifecycle metadata associated with
+// an authenticated API key.
+//
+// Struct tags are provided for both encoding/json and YAML unmarshaling
+// (compatible with gopkg.in/yaml.v3 and github.com/goccy/go-yaml).
 type KeyInfo struct {
-	ID        string         `json:"id" yaml:"id"`
-	Name      string         `json:"name,omitempty" yaml:"name,omitempty"`
-	Roles     []string       `json:"roles,omitempty" yaml:"roles,omitempty"`
-	Scopes    []string       `json:"scopes,omitempty" yaml:"scopes,omitempty"`
-	Metadata  map[string]any `json:"metadata,omitempty" yaml:"metadata,omitempty"`
-	ExpiresAt *time.Time     `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
-	Disabled  bool           `json:"disabled,omitempty" yaml:"disabled,omitempty"`
+	// ID uniquely identifies the key or principal (e.g., "key_01H..." or "service-billing").
+	ID string `json:"id" yaml:"id"`
+
+	// Name is an optional human-readable label for the key or client application.
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
+
+	// Roles lists coarse-grained role names granted to this key (checked by
+	// [KeyInfo.HasRole], [RequireRole], [RequireAnyRole], and [RequireAllRoles]).
+	Roles []string `json:"roles,omitempty" yaml:"roles,omitempty"`
+
+	// Scopes lists fine-grained permission scopes granted to this key (checked by
+	// [KeyInfo.HasScope], [RequireScope], [RequireAnyScope], and [RequireAllScopes]).
+	Scopes []string `json:"scopes,omitempty" yaml:"scopes,omitempty"`
+
+	// Metadata stores arbitrary caller-defined key-value attributes (e.g., tenant ID,
+	// rate-limit tier, or environment).
+	Metadata map[string]any `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+
+	// ExpiresAt is an optional UTC timestamp after which the key is rejected with
+	// [ErrKeyExpired]. When nil, the key does not expire.
+	ExpiresAt *time.Time `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
+
+	// Disabled marks the key as revoked or suspended when true, causing validation
+	// to fail with [ErrKeyDisabled].
+	Disabled bool `json:"disabled,omitempty" yaml:"disabled,omitempty"`
 }
 
-// Clone returns a copy of KeyInfo with cloned slices, metadata map, and expiration timestamp.
+// Clone returns a copy of k with shallow-cloned Roles, Scopes, and Metadata
+// containers and an independent ExpiresAt value. It returns nil if k is nil.
 func (k *KeyInfo) Clone() *KeyInfo {
 	if k == nil {
 		return nil
@@ -75,12 +102,16 @@ func (k *KeyInfo) Clone() *KeyInfo {
 	return &cp
 }
 
-// IsValid checks if the key info is non-nil, not disabled, and not expired as of time.Now().
+// IsValid reports whether k is non-nil, not disabled, and not expired as of [time.Now].
+// It returns [ErrInvalidKey] if k is nil, [ErrKeyDisabled] if k.Disabled is true,
+// or [ErrKeyExpired] if k.ExpiresAt is before the current time.
 func (k *KeyInfo) IsValid() error {
 	return k.IsValidAt(time.Now())
 }
 
-// IsValidAt checks if the key info is non-nil, not disabled, and not expired at the given time.
+// IsValidAt reports whether k is non-nil, not disabled, and not expired at the
+// supplied instant now. It returns [ErrInvalidKey], [ErrKeyDisabled], or
+// [ErrKeyExpired] on failure, or nil when valid.
 func (k *KeyInfo) IsValidAt(now time.Time) error {
 	if k == nil {
 		return ErrInvalidKey
@@ -94,12 +125,13 @@ func (k *KeyInfo) IsValidAt(now time.Time) error {
 	return nil
 }
 
-// HasRole returns true if the key has the given role.
+// HasRole reports whether k is non-nil and contains role in k.Roles.
 func (k *KeyInfo) HasRole(role string) bool {
 	return k != nil && slices.Contains(k.Roles, role)
 }
 
-// HasAnyRole returns true if the key has at least one of the given roles.
+// HasAnyRole reports whether k is non-nil and contains at least one of roles in k.Roles.
+// It returns false if roles is empty.
 func (k *KeyInfo) HasAnyRole(roles ...string) bool {
 	if k == nil {
 		return false
@@ -112,7 +144,8 @@ func (k *KeyInfo) HasAnyRole(roles ...string) bool {
 	return false
 }
 
-// HasAllRoles returns true if the key has all of the given roles.
+// HasAllRoles reports whether k is non-nil, roles is non-empty, and every specified
+// role is present in k.Roles.
 func (k *KeyInfo) HasAllRoles(roles ...string) bool {
 	if k == nil || len(roles) == 0 {
 		return false
@@ -125,12 +158,13 @@ func (k *KeyInfo) HasAllRoles(roles ...string) bool {
 	return true
 }
 
-// HasScope returns true if the key has the given scope.
+// HasScope reports whether k is non-nil and contains scope in k.Scopes.
 func (k *KeyInfo) HasScope(scope string) bool {
 	return k != nil && slices.Contains(k.Scopes, scope)
 }
 
-// HasAnyScope returns true if the key has at least one of the given scopes.
+// HasAnyScope reports whether k is non-nil and contains at least one of scopes in k.Scopes.
+// It returns false if scopes is empty.
 func (k *KeyInfo) HasAnyScope(scopes ...string) bool {
 	if k == nil {
 		return false
@@ -143,7 +177,8 @@ func (k *KeyInfo) HasAnyScope(scopes ...string) bool {
 	return false
 }
 
-// HasAllScopes returns true if the key has all of the given scopes.
+// HasAllScopes reports whether k is non-nil, scopes is non-empty, and every specified
+// scope is present in k.Scopes.
 func (k *KeyInfo) HasAllScopes(scopes ...string) bool {
 	if k == nil || len(scopes) == 0 {
 		return false
@@ -156,23 +191,32 @@ func (k *KeyInfo) HasAllScopes(scopes ...string) bool {
 	return true
 }
 
-// Store is the interface for validating and looking up API keys.
-// Implementations can query memory, config files, SQL databases, Redis, or external identity providers.
+// Store resolves and validates a raw API key string.
+//
+// Implementations should return [ErrKeyNotFound] when key is unknown, and may
+// return [ErrKeyDisabled], [ErrKeyExpired], or backend-specific errors (such as
+// database timeouts). Both [New] and [CachedStore] automatically validate the
+// returned [*KeyInfo] with [KeyInfo.IsValidAt], so custom stores only need to
+// populate Disabled and ExpiresAt on the returned struct.
+//
+// Implementations must be safe for concurrent use by multiple goroutines.
 type Store interface {
 	Lookup(ctx context.Context, key string) (*KeyInfo, error)
 }
 
-// StoreFunc is a functional adapter that implements Store.
+// StoreFunc is a functional adapter that allows ordinary functions to be used as a [Store].
 type StoreFunc func(ctx context.Context, key string) (*KeyInfo, error)
 
-// Lookup calls the underlying function.
+// Lookup calls f(ctx, key).
 func (f StoreFunc) Lookup(ctx context.Context, key string) (*KeyInfo, error) {
 	return f(ctx, key)
 }
 
-// HashKey returns the lowercase hex-encoded SHA-256 digest of a raw API key.
-// Use this helper to generate digests for NewHashedMemoryStore so plaintext secrets
-// do not need to be stored in configuration files.
+// HashKey returns the lowercase 64-character hex-encoded SHA-256 digest of rawKey.
+//
+// Use HashKey during key provisioning or in CLI tooling to generate digests for
+// [NewHashedMemoryStore] or external SQL/NoSQL stores so plaintext API keys never
+// need to be persisted.
 func HashKey(rawKey string) string {
 	sum := sha256.Sum256([]byte(rawKey))
 	return hex.EncodeToString(sum[:])
@@ -200,15 +244,23 @@ type memoryEntry struct {
 	info   *KeyInfo
 }
 
-// MemoryStore stores API keys in memory using SHA-256 digests and fixed-length
-// constant-time comparison. Safe for concurrent reads and writes.
+// MemoryStore is a concurrency-safe in-memory [Store] backed by precomputed
+// SHA-256 key digests.
+//
+// Lookups hash the incoming key once with SHA-256 and perform fixed-length
+// [subtle.ConstantTimeCompare] checks across every entry in the store without
+// early exit, preventing timing side-channels on both key content and key length.
+// Returned [*KeyInfo] values are cloned so caller mutations cannot corrupt store state.
 type MemoryStore struct {
 	mu      sync.RWMutex
 	entries []memoryEntry
 	now     func() time.Time
 }
 
-// NewMemoryStore creates a new in-memory API key store from raw keys.
+// NewMemoryStore creates a [MemoryStore] from a map of raw API keys to [*KeyInfo].
+//
+// Each [*KeyInfo] is cloned on insertion. If a map entry has a nil [*KeyInfo], a
+// default KeyInfo with ID set to the raw key string is created.
 func NewMemoryStore(keys map[string]*KeyInfo) *MemoryStore {
 	m := &MemoryStore{
 		entries: make([]memoryEntry, 0, len(keys)),
@@ -224,7 +276,8 @@ func NewMemoryStore(keys map[string]*KeyInfo) *MemoryStore {
 	return m
 }
 
-// NewStaticKeyStore creates an in-memory store from a slice of valid raw keys.
+// NewStaticKeyStore creates a [MemoryStore] from a list of valid raw API keys,
+// assigning each key's [KeyInfo.ID] to the key string itself.
 func NewStaticKeyStore(validKeys ...string) *MemoryStore {
 	m := &MemoryStore{
 		entries: make([]memoryEntry, 0, len(validKeys)),
@@ -236,8 +289,12 @@ func NewStaticKeyStore(validKeys ...string) *MemoryStore {
 	return m
 }
 
-// NewHashedMemoryStore creates an in-memory store from pre-hashed SHA-256 hex digests
-// (either raw 64-character hex strings or prefixed with "sha256:").
+// NewHashedMemoryStore creates a [MemoryStore] from pre-hashed SHA-256 hex digests.
+//
+// Map keys may be 64-character hexadecimal strings or prefixed with "sha256:"
+// (case-insensitive), as produced by [HashKey]. If any digest is malformed, an
+// error is returned. When a map value is nil, [KeyInfo.ID] defaults to the first
+// 16 hex characters of the digest.
 func NewHashedMemoryStore(hashedKeys map[string]*KeyInfo) (*MemoryStore, error) {
 	m := &MemoryStore{
 		entries: make([]memoryEntry, 0, len(hashedKeys)),
@@ -264,7 +321,8 @@ func (m *MemoryStore) clock() time.Time {
 	return time.Now()
 }
 
-// SetClock overrides the time source used for key expiration checks (useful in tests).
+// SetClock overrides the clock function used by [MemoryStore.Lookup] to evaluate
+// [KeyInfo.ExpiresAt]. Passing nil restores [time.Now].
 func (m *MemoryStore) SetClock(now func() time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -299,8 +357,12 @@ func (m *MemoryStore) deleteLocked(digest [sha256.Size]byte) {
 	}
 }
 
-// Lookup finds and validates the API key in memory using fixed-length SHA-256
-// constant-time comparison across all stored entries to prevent timing leaks.
+// Lookup hashes key with SHA-256, compares it in constant time against all stored
+// entries, and validates expiration and disabled status.
+//
+// It returns ctx.Err() if ctx is already canceled, [ErrKeyNotFound] if no entry
+// matches, [ErrKeyDisabled] if the key is disabled, or [ErrKeyExpired] if expired.
+// On success, a cloned [*KeyInfo] is returned.
 func (m *MemoryStore) Lookup(ctx context.Context, key string) (*KeyInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -330,7 +392,8 @@ func (m *MemoryStore) Lookup(ctx context.Context, key string) (*KeyInfo, error) 
 	return foundInfo, nil
 }
 
-// Set adds or updates a raw key in the memory store.
+// Set inserts or replaces a raw API key in the store. The provided info is cloned;
+// if info is nil, a default [KeyInfo] with ID set to key is stored.
 func (m *MemoryStore) Set(key string, info *KeyInfo) {
 	cloned := info.Clone()
 	if cloned == nil {
@@ -343,7 +406,9 @@ func (m *MemoryStore) Set(key string, info *KeyInfo) {
 	m.upsertLocked(digest, cloned)
 }
 
-// SetHashed adds or updates a pre-hashed SHA-256 key (64-char hex or "sha256:<hex>") in the memory store.
+// SetHashed inserts or replaces an API key identified by its SHA-256 hex digest
+// (raw 64-character hex or prefixed with "sha256:"). Returns an error if hexDigest
+// is not a valid SHA-256 hex string.
 func (m *MemoryStore) SetHashed(hexDigest string, info *KeyInfo) error {
 	digest, err := parseHexDigest(hexDigest)
 	if err != nil {
@@ -360,7 +425,7 @@ func (m *MemoryStore) SetHashed(hexDigest string, info *KeyInfo) error {
 	return nil
 }
 
-// Delete removes a raw key from the memory store.
+// Delete removes a raw API key from the store if present.
 func (m *MemoryStore) Delete(key string) {
 	digest := sha256.Sum256([]byte(key))
 
@@ -369,7 +434,8 @@ func (m *MemoryStore) Delete(key string) {
 	m.deleteLocked(digest)
 }
 
-// DeleteHashed removes a pre-hashed SHA-256 key from the memory store.
+// DeleteHashed removes a pre-hashed SHA-256 key (64-character hex or "sha256:<hex>")
+// from the store. Returns an error if hexDigest is malformed.
 func (m *MemoryStore) DeleteHashed(hexDigest string) error {
 	digest, err := parseHexDigest(hexDigest)
 	if err != nil {
@@ -382,7 +448,7 @@ func (m *MemoryStore) DeleteHashed(hexDigest string) error {
 	return nil
 }
 
-// Len returns the number of keys currently stored in memory.
+// Len returns the number of keys currently held in the store.
 func (m *MemoryStore) Len() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -435,32 +501,40 @@ func (g *flightGroup) do(ctx context.Context, key [sha256.Size]byte, fn func() (
 	return c.info.Clone(), c.err
 }
 
-// CachedStoreConfig configures a CachedStore instance.
+// CachedStoreConfig configures a [CachedStore] created via [NewCachedStoreWithConfig].
 type CachedStoreConfig struct {
-	// Store is the underlying API key store to query on cache misses. Required.
+	// Store is the underlying API key store queried on cache misses. Required; nil panics.
 	Store Store
 
-	// TTL is how long valid key lookups remain cached.
+	// TTL is the duration for which valid key lookups remain cached.
+	// If TTL <= 0, caching is bypassed and every lookup delegates directly to Store.
 	TTL time.Duration
 
-	// NegativeTTL is how long negative key results (ErrKeyNotFound, ErrKeyDisabled, ErrKeyExpired)
-	// remain cached. If zero and DisableNegativeCache is false, defaults to min(TTL, 30s).
+	// NegativeTTL is the duration for which negative authentication errors
+	// ([ErrKeyNotFound], [ErrKeyDisabled], [ErrKeyExpired]) remain cached.
+	// When <= 0 and DisableNegativeCache is false, defaults to min(TTL, [DefaultNegativeCacheTTL]).
 	NegativeTTL time.Duration
 
-	// DisableNegativeCache disables caching of negative lookup results when true.
+	// DisableNegativeCache disables caching of negative lookup results when true,
+	// so only valid [*KeyInfo] lookups are cached.
 	DisableNegativeCache bool
 
-	// MaxEntries bounds the maximum number of cached entries to prevent unbounded memory growth.
-	// Defaults to DefaultCacheMaxEntries (10,000) if <= 0.
+	// MaxEntries caps the total number of entries stored in memory to prevent
+	// unbounded growth under random-key floods. Defaults to [DefaultCacheMaxEntries] if <= 0.
 	MaxEntries int
 
-	// Now is an optional clock function used for TTL and expiration checks (defaults to time.Now).
+	// Now supplies the current time for TTL and [KeyInfo.ExpiresAt] checks.
+	// Defaults to [time.Now] when nil.
 	Now func() time.Time
 }
 
-// CachedStore wraps any Store with bounded, concurrency-safe TTL caching and singleflight
-// request deduplication. Transient backend errors (such as database or network timeouts)
-// are never cached.
+// CachedStore wraps any [Store] with bounded, concurrency-safe in-memory TTL
+// caching and singleflight request coalescing.
+//
+// Cache entries are keyed by SHA-256 digest so raw secrets are not retained as
+// map keys in memory. Concurrent cache misses for the same key share a single
+// underlying [Store.Lookup] call, and transient backend errors (such as database
+// or network timeouts) are never cached.
 type CachedStore struct {
 	underlying      Store
 	ttl             time.Duration
@@ -474,7 +548,9 @@ type CachedStore struct {
 	flights flightGroup
 }
 
-// NewCachedStore wraps an existing Store with a bounded TTL in-memory cache.
+// NewCachedStore wraps underlying with a bounded in-memory TTL cache using default
+// negative-caching (min(ttl, [DefaultNegativeCacheTTL])) and capacity
+// ([DefaultCacheMaxEntries]). It panics if underlying is nil.
 func NewCachedStore(underlying Store, ttl time.Duration) *CachedStore {
 	return NewCachedStoreWithConfig(CachedStoreConfig{
 		Store: underlying,
@@ -482,7 +558,8 @@ func NewCachedStore(underlying Store, ttl time.Duration) *CachedStore {
 	})
 }
 
-// NewCachedStoreWithConfig creates a CachedStore with custom caching parameters.
+// NewCachedStoreWithConfig creates a [CachedStore] using the supplied [CachedStoreConfig].
+// It panics if cfg.Store is nil.
 func NewCachedStoreWithConfig(cfg CachedStoreConfig) *CachedStore {
 	if cfg.Store == nil {
 		panic("apikey: CachedStore requires a non-nil underlying Store")
@@ -560,7 +637,12 @@ func (c *CachedStore) putCached(digest [sha256.Size]byte, item cachedItem, now t
 	c.items[digest] = item
 }
 
-// Lookup looks up a key in the cache or falls back to the underlying store.
+// Lookup resolves key from the in-memory cache or falls back to the underlying
+// [Store] on a cache miss, coalescing concurrent lookups for the same key.
+//
+// [KeyInfo.IsValidAt] is evaluated on both cache misses and cache hits, ensuring
+// keys whose [KeyInfo.ExpiresAt] passes before the cache TTL elapses are rejected
+// immediately. Returned [*KeyInfo] pointers are cloned.
 func (c *CachedStore) Lookup(ctx context.Context, key string) (*KeyInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -641,7 +723,8 @@ func (c *CachedStore) Lookup(ctx context.Context, key string) (*KeyInfo, error) 
 	})
 }
 
-// Invalidate removes a single raw key from the cache.
+// Invalidate evicts a single raw API key from the cache. Use this when revoking
+// or rotating a key to force an immediate lookup against the underlying [Store].
 func (c *CachedStore) Invalidate(key string) {
 	digest := sha256.Sum256([]byte(key))
 	c.mu.Lock()
@@ -649,14 +732,15 @@ func (c *CachedStore) Invalidate(key string) {
 	c.mu.Unlock()
 }
 
-// Purge removes all entries from the cache.
+// Purge evicts all entries from the cache.
 func (c *CachedStore) Purge() {
 	c.mu.Lock()
 	clear(c.items)
 	c.mu.Unlock()
 }
 
-// Len returns the current number of entries held in the cache.
+// Len returns the current number of entries stored in the cache (including any
+// entries whose TTL has elapsed prior to lazy eviction).
 func (c *CachedStore) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

@@ -943,6 +943,240 @@ func TestEdgeCasesAndFullCoverage(t *testing.T) {
 	_ = apikey.NewCachedStoreWithConfig(apikey.CachedStoreConfig{})
 }
 
+func TestUsageMeteringAndInvoicingAggregator(t *testing.T) {
+	baseNow := time.Date(2026, 10, 24, 15, 0, 0, 0, time.UTC)
+	aggregator := apikey.NewMemoryUsageAggregator()
+
+	var recordedEvents []apikey.UsageRecord
+	var mu sync.Mutex
+	teeRecorder := apikey.UsageRecorderFunc(func(ctx context.Context, rec apikey.UsageRecord) error {
+		mu.Lock()
+		recordedEvents = append(recordedEvents, rec)
+		mu.Unlock()
+		return aggregator.RecordUsage(ctx, rec)
+	})
+
+	store := apikey.NewMemoryStore(map[string]*apikey.KeyInfo{
+		"cust-key": {
+			ID:       "cust_100",
+			Name:     "Acme Oy",
+			Roles:    []string{"member"},
+			Metadata: map[string]any{"plan": "pro"},
+		},
+	})
+
+	r := gin.New()
+	r.Use(apikey.New(apikey.Config{
+		Store:         store,
+		UsageRecorder: teeRecorder,
+		Now:           func() time.Time { return baseNow },
+	}))
+
+	// 1. Default 1-unit billable endpoint
+	r.GET("/v1/items/:id", func(c *gin.Context) {
+		c.String(http.StatusOK, "hello-body")
+	})
+
+	// 2. Variable batch endpoint using AddUsageUnits + SetUsageAttribute
+	r.POST("/v1/batch", func(c *gin.Context) {
+		for i := 0; i < 3; i++ {
+			apikey.AddUsageUnits(c, 4)
+		}
+		apikey.SetUsageAttribute(c, "sku", "batch-v1")
+		c.String(http.StatusOK, "done")
+	})
+
+	// 3. Dry-run endpoint overriding Billable to false even on 200 OK
+	r.POST("/v1/dry-run", func(c *gin.Context) {
+		apikey.SetUsageUnits(c, 10)
+		apikey.SetBillable(c, false)
+		c.Status(http.StatusOK)
+	})
+
+	// 4. Forbidden RBAC endpoint (403 -> non-billable by DefaultBillableFilter)
+	r.DELETE("/v1/admin", apikey.RequireRole("admin"), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	// 5. Server error endpoint (500 -> non-billable by DefaultBillableFilter)
+	r.GET("/v1/fail", func(c *gin.Context) {
+		c.String(http.StatusInternalServerError, "boom")
+	})
+
+	send := func(method, path string, bodyLen int) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(method, path, nil)
+		req.ContentLength = int64(bodyLen)
+		req.Header.Set("X-API-Key", "cust-key")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	send(http.MethodGet, "/v1/items/42", -1) // ContentLength -1 clamped to 0, 1 billable unit
+	send(http.MethodPost, "/v1/batch", 128)  // 12 billable units, 128 req bytes
+	send(http.MethodPost, "/v1/dry-run", 32) // 10 non-billable units (SetBillable(false))
+	send(http.MethodDelete, "/v1/admin", 0)  // 403 Forbidden -> 1 non-billable unit
+	send(http.MethodGet, "/v1/fail", 0)      // 500 Error -> 1 non-billable unit
+
+	sum, ok := aggregator.Summary("cust_100")
+	if !ok {
+		t.Fatalf("expected summary for cust_100")
+	}
+	if sum.TotalRequests != 5 {
+		t.Errorf("expected TotalRequests=5, got %d", sum.TotalRequests)
+	}
+	if sum.BillableRequests != 2 {
+		t.Errorf("expected BillableRequests=2, got %d", sum.BillableRequests)
+	}
+	if sum.BillableUnits != 13 {
+		t.Errorf("expected BillableUnits=13 (1 + 12), got %d", sum.BillableUnits)
+	}
+	if sum.TotalUnits != 25 {
+		t.Errorf("expected TotalUnits=25 (1 + 12 + 10 + 1 + 1), got %d", sum.TotalUnits)
+	}
+	if sum.RequestBytes != 160 {
+		t.Errorf("expected RequestBytes=160 (0 + 128 + 32), got %d", sum.RequestBytes)
+	}
+	if sum.ResponseBytes != int64(len("hello-body")+len("done")+len("boom")) {
+		// Note: 403 JSON response also writes bytes; verify at least >= payload bytes
+		if sum.ResponseBytes < int64(len("hello-body")+len("done")+len("boom")) {
+			t.Errorf("unexpected ResponseBytes=%d", sum.ResponseBytes)
+		}
+	}
+
+	// Route template aggregation ("GET /v1/items/:id", not "/v1/items/42")
+	itemRoute, ok := sum.ByRoute["GET /v1/items/:id"]
+	if !ok || itemRoute.BillableUnits != 1 {
+		t.Fatalf("expected route summary under 'GET /v1/items/:id', got %+v", sum.ByRoute)
+	}
+
+	// Verify recorded event attributes & metadata isolation
+	if recordedEvents[1].Attributes["sku"] != "batch-v1" || recordedEvents[1].KeyMetadata["plan"] != "pro" {
+		t.Errorf("expected custom sku attribute and key metadata on UsageRecord, got %+v", recordedEvents[1])
+	}
+
+	// Snapshot keeps state; Flush atomically returns and resets state
+	snap := aggregator.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 entry in Snapshot, got %d", len(snap))
+	}
+	flushed := aggregator.Flush()
+	if flushed["cust_100"].BillableUnits != 13 {
+		t.Fatalf("expected flushed BillableUnits=13, got %d", flushed["cust_100"].BillableUnits)
+	}
+	if _, stillPresent := aggregator.Summary("cust_100"); stillPresent {
+		t.Fatalf("expected aggregator to be empty after Flush()")
+	}
+}
+
+func TestAsyncUsageRecorderBatchingFlushOverflowAndShutdown(t *testing.T) {
+	var (
+		flushedCount atomic.Int64
+		batchCalls   atomic.Int64
+	)
+
+	async := apikey.NewAsyncUsageRecorder(apikey.AsyncUsageConfig{
+		BatchRecorder: apikey.UsageBatchRecorderFunc(func(ctx context.Context, records []apikey.UsageRecord) error {
+			batchCalls.Add(1)
+			flushedCount.Add(int64(len(records)))
+			return nil
+		}),
+		BufferSize:    64,
+		BatchSize:     10,
+		FlushInterval: time.Hour, // test explicit Flush & batch threshold without waiting on timer
+	})
+
+	// Enqueue 25 records -> 2 batches of 10 auto-flush, 5 remain in batch
+	for i := 0; i < 25; i++ {
+		err := async.RecordUsage(context.Background(), apikey.UsageRecord{
+			KeyID:      "cust_async",
+			Units:      2,
+			Billable:   true,
+			Attributes: map[string]any{"idx": i},
+		})
+		if err != nil {
+			t.Fatalf("unexpected RecordUsage error: %v", err)
+		}
+	}
+
+	// Synchronous Flush drains remaining 5 immediately
+	if err := async.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if got := flushedCount.Load(); got != 25 {
+		t.Fatalf("expected 25 flushed records after Flush(), got %d", got)
+	}
+
+	// Enqueue 3 more and verify Shutdown drains them cleanly
+	for i := 0; i < 3; i++ {
+		_ = async.RecordUsage(context.Background(), apikey.UsageRecord{KeyID: "cust_async", Units: 1})
+	}
+	if err := async.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown failed: %v", err)
+	}
+	if got := flushedCount.Load(); got != 28 {
+		t.Fatalf("expected 28 total flushed records after Shutdown(), got %d", got)
+	}
+
+	// Recording after Shutdown returns ErrUsageRecorderClosed
+	if err := async.RecordUsage(context.Background(), apikey.UsageRecord{KeyID: "x"}); !errors.Is(err, apikey.ErrUsageRecorderClosed) {
+		t.Fatalf("expected ErrUsageRecorderClosed after Shutdown, got %v", err)
+	}
+
+	// Non-blocking overflow & UsageErrorHandler integration
+	gate := make(chan struct{})
+	var overflowNotified atomic.Int64
+	tinyAsync := apikey.NewAsyncUsageRecorder(apikey.AsyncUsageConfig{
+		Recorder: apikey.UsageRecorderFunc(func(ctx context.Context, rec apikey.UsageRecord) error {
+			<-gate
+			return errors.New("sink write failure")
+		}),
+		BufferSize:    1,
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		OnError: func(err error, records []apikey.UsageRecord) {
+			overflowNotified.Add(int64(len(records)))
+		},
+	})
+
+	// Fill worker + 1-slot buffer until ErrUsageBufferFull triggers
+	var sawFull bool
+	for i := 0; i < 20; i++ {
+		if err := tinyAsync.RecordUsage(context.Background(), apikey.UsageRecord{KeyID: "k"}); errors.Is(err, apikey.ErrUsageBufferFull) {
+			sawFull = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+	_ = tinyAsync.Shutdown(context.Background())
+
+	if !sawFull || overflowNotified.Load() == 0 {
+		t.Fatalf("expected buffer overflow error and OnError callback, sawFull=%v notified=%d", sawFull, overflowNotified.Load())
+	}
+
+	// UsageErrorHandler callback in middleware when synchronous recorder errors
+	var middlewareUsageErr error
+	r := gin.New()
+	r.Use(apikey.New(apikey.Config{
+		Store: apikey.NewStaticKeyStore("k"),
+		UsageRecorder: apikey.UsageRecorderFunc(func(ctx context.Context, record apikey.UsageRecord) error {
+			return errors.New("billing db down")
+		}),
+		UsageErrorHandler: func(c *gin.Context, record apikey.UsageRecord, err error) {
+			middlewareUsageErr = err
+		},
+	}))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req, _ := http.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("X-API-Key", "k")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || middlewareUsageErr == nil {
+		t.Fatalf("expected 200 OK response and UsageErrorHandler called, code=%d err=%v", w.Code, middlewareUsageErr)
+	}
+}
+
 func BenchmarkMemoryStoreLookup(b *testing.B) {
 	keys := make(map[string]*apikey.KeyInfo, 32)
 	for i := 0; i < 32; i++ {

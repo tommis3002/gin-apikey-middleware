@@ -1,10 +1,10 @@
-// Package apikey provides flexible, production-ready API key authentication
-// and role/scope authorization middleware for the Gin web framework.
 package apikey
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -13,27 +13,39 @@ import (
 )
 
 const (
-	// DefaultContextKey is the key under which the *KeyInfo is saved in gin.Context.
+	// DefaultContextKey is the default [*gin.Context] key under which the authenticated
+	// [*KeyInfo] is stored by [New] and read by [Get] and [MustGet].
 	DefaultContextKey = "apiKeyInfo"
 
-	// DefaultRawKeyContextKey is the key under which the raw API key string is saved in gin.Context.
+	// DefaultRawKeyContextKey is the default [*gin.Context] key under which the raw
+	// API key string is stored by [New] and read by [GetKey].
 	DefaultRawKeyContextKey = "apiKey"
 
-	// DefaultHeader is the default HTTP header checked for the API key.
+	// DefaultHeader is the default HTTP request header inspected when [Config.Extractor]
+	// is nil.
 	DefaultHeader = "X-API-Key"
 
-	// DefaultRealm is the default authentication realm used in the WWW-Authenticate header.
+	// DefaultRealm is the default authentication realm emitted in the "WWW-Authenticate"
+	// response header on 401 Unauthorized responses when [Config.Realm] is empty.
 	DefaultRealm = "API"
 
 	activeContextKey       = "_apikey_ctx_key"
 	activeRawKeyContextKey = "_apikey_raw_ctx_key"
 )
 
-// Extractor is a function that retrieves an API key string from the request context.
+// Extractor retrieves a raw API key string from an incoming [*gin.Context].
+//
+// Implementations should return [ErrMissingKey] when no credential is present on
+// the request, or [ErrInvalidKey] when a credential container is present with a
+// malformed format (such as an unexpected Authorization scheme).
 type Extractor func(c *gin.Context) (string, error)
 
-// FromHeader creates an extractor that reads the API key from a specific HTTP header,
-// optionally stripping a case-insensitive prefix (e.g., "Bearer " or "ApiKey ").
+// FromHeader returns an [Extractor] that reads the API key from headerName.
+//
+// If an optional prefix is supplied (for example, "Bearer " or "ApiKey "), it is
+// matched case-insensitively and stripped before trimming surrounding whitespace.
+// Returns [ErrMissingKey] if the header is absent or empty after stripping the
+// prefix, or [ErrInvalidKey] if the header value does not start with prefix.
 func FromHeader(headerName string, prefix ...string) Extractor {
 	p := ""
 	if len(prefix) > 0 {
@@ -60,7 +72,11 @@ func FromHeader(headerName string, prefix ...string) Extractor {
 	}
 }
 
-// FromQuery creates an extractor that reads the API key from a URL query parameter.
+// FromQuery returns an [Extractor] that reads the API key from the URL query
+// parameter paramName. Returns [ErrMissingKey] if the parameter is absent or empty.
+//
+// Note: URL query parameters may be recorded in reverse-proxy or access logs;
+// prefer header-based extractors ([FromHeader], [FromBearer]) when possible.
 func FromQuery(paramName string) Extractor {
 	return func(c *gin.Context) (string, error) {
 		val := c.Query(paramName)
@@ -71,7 +87,8 @@ func FromQuery(paramName string) Extractor {
 	}
 }
 
-// FromCookie creates an extractor that reads the API key from an HTTP cookie.
+// FromCookie returns an [Extractor] that reads the API key from the HTTP cookie
+// named cookieName. Returns [ErrMissingKey] if the cookie is missing or empty.
 func FromCookie(cookieName string) Extractor {
 	return func(c *gin.Context) (string, error) {
 		val, err := c.Cookie(cookieName)
@@ -82,14 +99,19 @@ func FromCookie(cookieName string) Extractor {
 	}
 }
 
-// FromBearer creates an extractor that reads the key from the "Authorization: Bearer <key>" header.
+// FromBearer returns an [Extractor] that reads the API key from an
+// "Authorization: Bearer <key>" request header (matched case-insensitively).
 func FromBearer() Extractor {
 	return FromHeader("Authorization", "Bearer ")
 }
 
-// FromFirstOf tries multiple extractors in order until one returns a non-empty key.
-// If no extractor succeeds and at least one returned an error other than ErrMissingKey
-// (for example, ErrInvalidKey from a malformed header), the first such error is returned.
+// FromFirstOf returns an [Extractor] that evaluates extractors in order and
+// returns the first non-empty key extracted without error.
+//
+// If all extractors fail and at least one returned an error other than
+// [ErrMissingKey] (for example, [ErrInvalidKey] from a malformed Authorization
+// header), that first non-missing error is returned; otherwise [ErrMissingKey]
+// is returned.
 func FromFirstOf(extractors ...Extractor) Extractor {
 	return func(c *gin.Context) (string, error) {
 		var firstErr error
@@ -109,51 +131,78 @@ func FromFirstOf(extractors ...Extractor) Extractor {
 	}
 }
 
-// Config defines the configuration for the API key middleware.
+// Config configures the authentication middleware created by [New].
 type Config struct {
-	// Store is the API key lookup provider (memory, config, database, redis, etc.). Required.
+	// Store is the API key lookup provider (memory, config, SQL, Redis, etc.).
+	// Required; passing a nil Store to [New] panics at initialization time.
 	Store Store
 
-	// Extractor extracts the API key from the incoming request.
-	// Defaults to FromHeader("X-API-Key").
+	// Extractor extracts the raw API key from the incoming request.
+	// Defaults to FromHeader([DefaultHeader]) ("X-API-Key") when nil.
 	Extractor Extractor
 
-	// ContextKey is the gin.Context key where *KeyInfo will be stored.
-	// Defaults to "apiKeyInfo".
+	// ContextKey is the [*gin.Context] key under which the authenticated [*KeyInfo]
+	// is saved. Defaults to [DefaultContextKey] ("apiKeyInfo") when empty.
 	ContextKey string
 
-	// RawKeyContextKey is the gin.Context key where the raw key string will be stored.
-	// Defaults to "apiKey".
+	// RawKeyContextKey is the [*gin.Context] key under which the raw API key string
+	// is saved unless DisableRawKeyContext is true. Defaults to
+	// [DefaultRawKeyContextKey] ("apiKey") when empty.
 	RawKeyContextKey string
 
-	// DisableRawKeyContext prevents storing the plaintext API key in gin.Context when true.
-	// Useful to avoid accidental secret exposure in context-dumping loggers.
+	// DisableRawKeyContext prevents storing the plaintext API key in [*gin.Context]
+	// when true. Enable this when using request-logging or crash-reporting
+	// middlewares that serialize gin.Context.Keys.
 	DisableRawKeyContext bool
 
-	// Realm is the authentication realm included in the WWW-Authenticate response header
-	// on 401 Unauthorized responses. Defaults to "API".
+	// Realm sets the realm parameter in the "WWW-Authenticate: ApiKey realm=..."
+	// header written on 401 Unauthorized responses. Defaults to [DefaultRealm] ("API").
 	Realm string
 
-	// Skipper defines a function to skip authentication for certain requests.
-	// Optional.
+	// Skipper returns true for requests that should bypass API key authentication
+	// (such as "/health" or "/metrics"). Optional.
 	Skipper func(c *gin.Context) bool
 
-	// ErrorHandler is invoked when authentication fails. It receives the underlying error
-	// (e.g., ErrMissingKey, ErrKeyNotFound, ErrKeyExpired, or a backend datastore error).
-	// If nil, DefaultErrorHandler is used.
+	// ErrorHandler handles failed authentication attempts. It receives the exact
+	// error returned by Extractor, Store.Lookup, or KeyInfo.IsValidAt (such as
+	// [ErrMissingKey], [ErrKeyNotFound], [ErrKeyDisabled], [ErrKeyExpired], or an
+	// upstream datastore error). The middleware guarantees that c.Abort() is called
+	// afterward even if ErrorHandler omits it. Defaults to [DefaultErrorHandler].
 	ErrorHandler func(c *gin.Context, err error)
 
-	// SuccessHandler is an optional callback invoked after successful authentication
-	// (e.g., for audit logging, metrics, or updating last-used timestamps) before c.Next().
+	// SuccessHandler is an optional hook invoked after authentication succeeds and
+	// context values are set, right before calling c.Next(). If SuccessHandler
+	// aborts the context (for example, to enforce per-key rate limits), downstream
+	// handlers are not executed.
 	SuccessHandler func(c *gin.Context, info *KeyInfo)
 
-	// Now is an optional clock function used to validate KeyInfo.ExpiresAt (defaults to time.Now).
+	// UsageRecorder is an optional metering sink invoked after request handling
+	// completes for every authenticated API key request. Use [NewMemoryUsageAggregator]
+	// for in-memory billing window summaries, [NewAsyncUsageRecorder] for buffered
+	// background batching to SQL/Stripe/queues, or any custom [UsageRecorder].
+	UsageRecorder UsageRecorder
+
+	// BillableFilter determines whether a completed authenticated request is marked
+	// Billable on its [UsageRecord] when the route handler did not explicitly call
+	// [SetBillable]. Defaults to [DefaultBillableFilter] (2xx and 3xx status codes).
+	BillableFilter func(c *gin.Context, info *KeyInfo, statusCode int) bool
+
+	// UsageErrorHandler is an optional callback invoked when [UsageRecorder.RecordUsage]
+	// returns a non-nil error (for example, when an [AsyncUsageRecorder] buffer is full
+	// or a synchronous database write fails).
+	UsageErrorHandler func(c *gin.Context, record UsageRecord, err error)
+
+	// Now supplies the current time used to validate [KeyInfo.ExpiresAt] and stamp
+	// [UsageRecord.Timestamp]. Defaults to [time.Now] when nil.
 	Now func() time.Time
 }
 
-// DefaultErrorHandler writes a sanitized JSON 401 Unauthorized response with a
-// WWW-Authenticate header and aborts the request. To prevent key-enumeration and
-// internal error leaks, only ErrMissingKey is distinguished from invalid credentials.
+// DefaultErrorHandler writes a 401 Unauthorized JSON response, sets a
+// "WWW-Authenticate" challenge header if not already present, and aborts c.
+//
+// To prevent key-existence enumeration and internal datastore error leaks, the
+// response message is "missing api key" when err matches [ErrMissingKey] and
+// "invalid api key" for all other errors.
 func DefaultErrorHandler(c *gin.Context, err error) {
 	if c.Writer.Header().Get("WWW-Authenticate") == "" {
 		c.Header("WWW-Authenticate", fmt.Sprintf("ApiKey realm=%q", DefaultRealm))
@@ -168,7 +217,12 @@ func DefaultErrorHandler(c *gin.Context, err error) {
 	})
 }
 
-// New creates a new API key authentication middleware from the provided Config.
+// New creates a Gin authentication middleware from cfg.
+//
+// New panics if cfg.Store is nil. On each non-skipped request it extracts the
+// API key, resolves [*KeyInfo] from cfg.Store, enforces [KeyInfo.IsValidAt],
+// populates [*gin.Context] for [Get], [MustGet], [GetKey], and the Require*
+// authorization middlewares, runs [Config.SuccessHandler] if set, and calls c.Next().
 func New(cfg Config) gin.HandlerFunc {
 	if cfg.Store == nil {
 		panic("apikey middleware: Store is required")
@@ -188,6 +242,9 @@ func New(cfg Config) gin.HandlerFunc {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.BillableFilter == nil {
+		cfg.BillableFilter = DefaultBillableFilter
+	}
 	wwwAuth := fmt.Sprintf("ApiKey realm=%q", cfg.Realm)
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = DefaultErrorHandler
@@ -200,6 +257,61 @@ func New(cfg Config) gin.HandlerFunc {
 		cfg.ErrorHandler(c, err)
 		if !c.IsAborted() {
 			c.Abort()
+		}
+	}
+
+	recordUsage := func(c *gin.Context, info *KeyInfo, start time.Time) {
+		latency := max(cfg.Now().Sub(start), 0)
+		statusCode := c.Writer.Status()
+		reqBytes := max(c.Request.ContentLength, 0)
+		respBytes := max(int64(c.Writer.Size()), 0)
+
+		units := int64(1)
+		var (
+			billable    bool
+			billableSet bool
+			attrs       map[string]any
+		)
+		if rawState, exists := c.Get(usageStateContextKey); exists {
+			if st, ok := rawState.(*requestUsageState); ok && st != nil {
+				units = st.units
+				billable = st.billable
+				billableSet = st.billableSet
+				if len(st.attributes) > 0 {
+					attrs = maps.Clone(st.attributes)
+				}
+			}
+		}
+		if !billableSet {
+			billable = cfg.BillableFilter(c, info, statusCode)
+		}
+
+		var keyMeta map[string]any
+		if len(info.Metadata) > 0 {
+			keyMeta = maps.Clone(info.Metadata)
+		}
+
+		rec := UsageRecord{
+			Timestamp:     start.UTC(),
+			KeyID:         info.ID,
+			KeyName:       info.Name,
+			KeyMetadata:   keyMeta,
+			Method:        c.Request.Method,
+			Route:         c.FullPath(),
+			Path:          c.Request.URL.Path,
+			StatusCode:    statusCode,
+			Latency:       latency,
+			RequestBytes:  reqBytes,
+			ResponseBytes: respBytes,
+			ClientIP:      c.ClientIP(),
+			Units:         units,
+			Billable:      billable,
+			Attributes:    attrs,
+		}
+
+		recCtx := context.WithoutCancel(c.Request.Context())
+		if recErr := cfg.UsageRecorder.RecordUsage(recCtx, rec); recErr != nil && cfg.UsageErrorHandler != nil {
+			cfg.UsageErrorHandler(c, rec, recErr)
 		}
 	}
 
@@ -224,7 +336,8 @@ func New(cfg Config) gin.HandlerFunc {
 			fail(c, ErrKeyNotFound)
 			return
 		}
-		if err := info.IsValidAt(cfg.Now()); err != nil {
+		start := cfg.Now()
+		if err := info.IsValidAt(start); err != nil {
 			fail(c, err)
 			return
 		}
@@ -244,31 +357,42 @@ func New(cfg Config) gin.HandlerFunc {
 		if cfg.SuccessHandler != nil {
 			cfg.SuccessHandler(c, info)
 			if c.IsAborted() {
+				if cfg.UsageRecorder != nil {
+					recordUsage(c, info, start)
+				}
 				return
 			}
 		}
 
 		c.Next()
+
+		if cfg.UsageRecorder != nil {
+			recordUsage(c, info, start)
+		}
 	}
 }
 
-// NewWithKeys is a quick helper to create an in-memory API key middleware with static keys.
+// NewWithKeys creates a middleware backed by [NewStaticKeyStore] and default
+// [Config] settings (extracting from the "X-API-Key" header).
 func NewWithKeys(validKeys ...string) gin.HandlerFunc {
 	return New(Config{
 		Store: NewStaticKeyStore(validKeys...),
 	})
 }
 
-// NewWithStore is a quick helper to create an API key middleware with a custom Store.
+// NewWithStore creates a middleware backed by store and default [Config] settings
+// (extracting from the "X-API-Key" header). It panics if store is nil.
 func NewWithStore(store Store) gin.HandlerFunc {
 	return New(Config{
 		Store: store,
 	})
 }
 
-// Get retrieves the authenticated *KeyInfo from gin.Context.
-// If contextKey is omitted, it checks DefaultContextKey and falls back to any custom
-// ContextKey configured on the active middleware.
+// Get retrieves the authenticated [*KeyInfo] from c.
+//
+// If contextKey is provided and non-empty, only contextKey[0] is checked.
+// Otherwise Get checks [DefaultContextKey] first and automatically falls back
+// to any custom [Config.ContextKey] registered by [New].
 func Get(c *gin.Context, contextKey ...string) (*KeyInfo, bool) {
 	if len(contextKey) > 0 && contextKey[0] != "" {
 		val, exists := c.Get(contextKey[0])
@@ -296,7 +420,8 @@ func Get(c *gin.Context, contextKey ...string) (*KeyInfo, bool) {
 	return nil, false
 }
 
-// MustGet retrieves the authenticated *KeyInfo or panics if not present.
+// MustGet retrieves the authenticated [*KeyInfo] from c using [Get] and panics
+// if no [*KeyInfo] is present. Only call MustGet on routes protected by [New].
 func MustGet(c *gin.Context, contextKey ...string) *KeyInfo {
 	info, ok := Get(c, contextKey...)
 	if !ok || info == nil {
@@ -305,8 +430,12 @@ func MustGet(c *gin.Context, contextKey ...string) *KeyInfo {
 	return info
 }
 
-// GetKey retrieves the raw API key string from gin.Context.
-// Returns an empty string if not present or if DisableRawKeyContext was enabled.
+// GetKey retrieves the raw API key string from c.
+//
+// Returns an empty string if the request was not authenticated or if
+// [Config.DisableRawKeyContext] was set to true. If rawKeyContextKey is omitted,
+// GetKey checks [DefaultRawKeyContextKey] and falls back to any custom
+// [Config.RawKeyContextKey] registered by [New].
 func GetKey(c *gin.Context, rawKeyContextKey ...string) string {
 	if len(rawKeyContextKey) > 0 && rawKeyContextKey[0] != "" {
 		val, exists := c.Get(rawKeyContextKey[0])
@@ -341,7 +470,11 @@ func abortForbidden(c *gin.Context, message string) {
 	})
 }
 
-// RequireRole creates an authorization middleware that ensures the authenticated API key has the required role.
+// RequireRole returns an authorization middleware that requires the authenticated
+// [*KeyInfo] to have role in [KeyInfo.Roles].
+//
+// Responds with 401 Unauthorized via [DefaultErrorHandler] if no [*KeyInfo] is
+// present in context, or 403 Forbidden if the role is missing.
 func RequireRole(role string, contextKey ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, ok := Get(c, contextKey...)
@@ -357,8 +490,11 @@ func RequireRole(role string, contextKey ...string) gin.HandlerFunc {
 	}
 }
 
-// RequireAnyRole creates an authorization middleware that ensures the authenticated API key
-// has at least one of the specified roles.
+// RequireAnyRole returns an authorization middleware that requires the
+// authenticated [*KeyInfo] to possess at least one of roles in [KeyInfo.Roles].
+//
+// Responds with 401 Unauthorized if unauthenticated, or 403 Forbidden if none
+// of the specified roles are present.
 func RequireAnyRole(roles ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, ok := Get(c)
@@ -374,8 +510,11 @@ func RequireAnyRole(roles ...string) gin.HandlerFunc {
 	}
 }
 
-// RequireAllRoles creates an authorization middleware that ensures the authenticated API key
-// has all of the specified roles.
+// RequireAllRoles returns an authorization middleware that requires the
+// authenticated [*KeyInfo] to possess every role listed in roles.
+//
+// Responds with 401 Unauthorized if unauthenticated, or 403 Forbidden if any
+// role is missing (or if roles is empty).
 func RequireAllRoles(roles ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, ok := Get(c)
@@ -391,7 +530,11 @@ func RequireAllRoles(roles ...string) gin.HandlerFunc {
 	}
 }
 
-// RequireScope creates an authorization middleware that ensures the authenticated API key has the required scope.
+// RequireScope returns an authorization middleware that requires the authenticated
+// [*KeyInfo] to have scope in [KeyInfo.Scopes].
+//
+// Responds with 401 Unauthorized via [DefaultErrorHandler] if no [*KeyInfo] is
+// present in context, or 403 Forbidden if the scope is missing.
 func RequireScope(scope string, contextKey ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, ok := Get(c, contextKey...)
@@ -407,8 +550,11 @@ func RequireScope(scope string, contextKey ...string) gin.HandlerFunc {
 	}
 }
 
-// RequireAnyScope creates an authorization middleware that ensures the authenticated API key
-// has at least one of the specified scopes.
+// RequireAnyScope returns an authorization middleware that requires the
+// authenticated [*KeyInfo] to possess at least one of scopes in [KeyInfo.Scopes].
+//
+// Responds with 401 Unauthorized if unauthenticated, or 403 Forbidden if none
+// of the specified scopes are present.
 func RequireAnyScope(scopes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, ok := Get(c)
@@ -424,8 +570,11 @@ func RequireAnyScope(scopes ...string) gin.HandlerFunc {
 	}
 }
 
-// RequireAllScopes creates an authorization middleware that ensures the authenticated API key
-// has all of the specified scopes.
+// RequireAllScopes returns an authorization middleware that requires the
+// authenticated [*KeyInfo] to possess every scope listed in scopes.
+//
+// Responds with 401 Unauthorized if unauthenticated, or 403 Forbidden if any
+// scope is missing (or if scopes is empty).
 func RequireAllScopes(scopes ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		info, ok := Get(c)

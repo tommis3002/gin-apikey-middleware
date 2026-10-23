@@ -11,6 +11,7 @@ A flexible, production-ready API key authentication and authorization middleware
 - 📥 **Flexible Extraction**: Extract API keys from custom headers (`X-API-Key`), Authorization Bearer tokens (`Authorization: Bearer <key>`), query parameters (`?api_key=...`), cookies (`FromCookie`), or fallback chains (`FromFirstOf`).
 - 👥 **Role-Based & Scope-Based Authorization**: Built-in guards `RequireRole`, `RequireAnyRole`, `RequireAllRoles`, `RequireScope`, `RequireAnyScope`, and `RequireAllScopes`.
 - ⏳ **Expiration & Revocation**: Consistent enforcement of `ExpiresAt` and `Disabled` across both in-memory and custom external stores.
+- 💳 **Invoicing & Usage Metering**: Record per-key request, unit, bandwidth, and route-level usage via `UsageRecorder`, with built-in atomic billing-window aggregation (`MemoryUsageAggregator`), buffered batch persistence (`AsyncUsageRecorder`), and dynamic handler unit helpers (`SetUsageUnits`, `AddUsageUnits`, `SetBillable`, `SetUsageAttribute`).
 - ⚙️ **Customizable**: Custom error handlers (receiving raw backend errors for logging/metrics while `DefaultErrorHandler` prevents key enumeration), `SuccessHandler` hooks, `WWW-Authenticate` realm headers, route skipping, and optional raw-key context redaction.
 
 ---
@@ -226,6 +227,61 @@ api := r.Group("/api", authMiddleware)
 	api.POST("/items", apikey.RequireAllScopes("items:read", "items:write"), handleCreateItem)
 	api.DELETE("/items/:id", apikey.RequireRole("admin"), handleDeleteItem)
 }
+```
+
+---
+
+### 6. Usage Metering & Invoicing
+
+Track billable requests, custom consumption units (e.g., batch items, tokens, credits), payload bytes, and per-route SKU breakdowns. By default (`DefaultBillableFilter`), `2xx`/`3xx` responses are marked `Billable: true` while `4xx`/`5xx` responses are still counted in total traffic with `Billable: false`.
+
+#### In-Memory Billing Window Aggregation (`MemoryUsageAggregator`)
+
+```go
+aggregator := apikey.NewMemoryUsageAggregator()
+
+r.Use(apikey.New(apikey.Config{
+	Store:         store,
+	UsageRecorder: aggregator,
+}))
+
+r.POST("/api/v1/ocr/batch", func(c *gin.Context) {
+	pagesProcessed := int64(12)
+	// Override the default 1 unit/request with exact consumption:
+	apikey.SetUsageUnits(c, pagesProcessed)
+	apikey.SetUsageAttribute(c, "sku", "ocr-standard")
+
+	c.JSON(http.StatusOK, gin.H{"pages": pagesProcessed})
+})
+
+// Periodically flush and persist summaries to your billing system (atomic swap, zero lost requests):
+summaries := aggregator.Flush()
+for keyID, summary := range summaries {
+	fmt.Printf("Customer %s: %d billable units across %d billable requests\n",
+		keyID, summary.BillableUnits, summary.BillableRequests)
+}
+```
+
+#### Buffered Asynchronous Batch Export (`AsyncUsageRecorder`)
+
+For high-throughput APIs writing directly to PostgreSQL, ClickHouse, Kafka, or Stripe Meters:
+
+```go
+asyncRecorder := apikey.NewAsyncUsageRecorder(apikey.AsyncUsageConfig{
+	BatchRecorder: apikey.UsageBatchRecorderFunc(func(ctx context.Context, batch []apikey.UsageRecord) error {
+		return insertUsageBatchIntoDB(ctx, batch)
+	}),
+	BufferSize:    8192,
+	BatchSize:     200,
+	FlushInterval: 5 * time.Second,
+	BlockWhenFull: true, // set true for strict zero-drop invoicing backpressure
+})
+defer asyncRecorder.Shutdown(context.Background()) // drains remaining records on shutdown
+
+r.Use(apikey.New(apikey.Config{
+	Store:         store,
+	UsageRecorder: asyncRecorder,
+}))
 ```
 
 ## License
