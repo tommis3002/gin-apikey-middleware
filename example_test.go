@@ -299,3 +299,57 @@ func ExampleNewAsyncUsageRecorder() {
 	// 1
 }
 
+func ExampleAddUsageUnits() {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	aggregator := apikey.NewMemoryUsageAggregator()
+	r.Use(apikey.New(apikey.Config{
+		Store:         apikey.NewStaticKeyStore("batch-key"),
+		UsageRecorder: aggregator,
+	}))
+
+	r.POST("/batch", func(c *gin.Context) {
+		for range 3 {
+			apikey.AddUsageUnits(c, 2)
+		}
+		apikey.SetUsageAttribute(c, "sku", "batch-item")
+		c.Status(http.StatusOK)
+	})
+
+	req, _ := http.NewRequest(http.MethodPost, "/batch", nil)
+	req.Header.Set("X-API-Key", "batch-key")
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	sum, _ := aggregator.Summary("batch-key")
+	fmt.Println(sum.BillableUnits)
+	// Output:
+	// 6
+}
+
+func ExampleSetBillable() {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	aggregator := apikey.NewMemoryUsageAggregator()
+	r.Use(apikey.New(apikey.Config{
+		Store:         apikey.NewStaticKeyStore("dryrun-key"),
+		UsageRecorder: aggregator,
+	}))
+
+	r.POST("/validate", func(c *gin.Context) {
+		apikey.SetBillable(c, false)
+		c.Status(http.StatusOK)
+	})
+
+	req, _ := http.NewRequest(http.MethodPost, "/validate", nil)
+	req.Header.Set("X-API-Key", "dryrun-key")
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	sum, _ := aggregator.Summary("dryrun-key")
+	fmt.Println(sum.TotalRequests, sum.BillableRequests, sum.BillableUnits)
+	// Output:
+	// 1 0 0
+}
+
+
