@@ -68,6 +68,25 @@
 // [RequireAllScopes]. Unauthenticated requests receive 401 Unauthorized, while
 // authenticated keys lacking required permissions receive 403 Forbidden.
 //
+// # Per-Key Rate Limiting
+//
+// Set [Config.RateLimit] (or attach the standalone [RateLimit] middleware to
+// specific routes/groups) to enforce token-bucket rate limits per authenticated
+// API key using [MemoryRateLimiter] or a custom distributed [RateLimiter] (such
+// as Redis). Individual keys can override global defaults or opt out via
+// [KeyInfo.RateLimit] ([KeyRateLimit]). Responses include standard
+// "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", and
+// "Retry-After" headers.
+//
+// # Reverse Proxy and Standalone API Gateway
+//
+// [NewReverseProxy] and [MustNewReverseProxy] create an authenticating edge
+// proxy handler ([ProxyConfig]) that strips raw client API keys, prevents header
+// spoofing, injects verified identity/metadata headers ("X-API-Key-ID", etc.),
+// counts streamed request payload bytes, and extracts dynamic upstream billing
+// headers ("X-Usage-Units", "X-Usage-Billable", "X-Usage-SKU"). A ready-to-run
+// YAML/JSON configurable gateway binary is also provided in cmd/apikey-proxy.
+//
 // # Usage Metering and Invoicing
 //
 // Set [Config.UsageRecorder] to capture a [UsageRecord] after each authenticated

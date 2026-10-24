@@ -5,6 +5,8 @@
 *.so
 *.dylib
 /example/example
+/apikey-proxy
+usage-records.jsonl
 
 # Test binary, built with `go test -c`
 *.test

@@ -352,4 +352,63 @@ func ExampleSetBillable() {
 	// 1 0 0
 }
 
+func ExampleRateLimit() {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	r.Use(apikey.New(apikey.Config{
+		Store: apikey.NewStaticKeyStore("rl-key"),
+		RateLimit: &apikey.RateLimitConfig{
+			RequestsPerSecond: 10,
+			Burst:             1,
+		},
+	}))
+	r.GET("/ping", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	send := func() int {
+		req, _ := http.NewRequest(http.MethodGet, "/ping", nil)
+		req.Header.Set("X-API-Key", "rl-key")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	fmt.Println(send(), send())
+	// Output:
+	// 200 429
+}
+
+func ExampleNewReverseProxy() {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, r.Header.Get("X-API-Key-ID"))
+	}))
+	defer upstream.Close()
+
+	proxyHandler, err := apikey.NewReverseProxy(apikey.ProxyConfig{
+		Target: upstream.URL,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	r := gin.New()
+	r.Use(apikey.New(apikey.Config{
+		Store: apikey.NewMemoryStore(map[string]*apikey.KeyInfo{
+			"edge-secret": {ID: "svc-edge"},
+		}),
+	}))
+	r.Any("/*path", proxyHandler)
+
+	req, _ := http.NewRequest(http.MethodGet, "/hello", nil)
+	req.Header.Set("X-API-Key", "edge-secret")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	fmt.Println(w.Code, w.Body.String())
+	// Output:
+	// 200 svc-edge
+}
+
+
 

@@ -172,9 +172,15 @@ type Config struct {
 
 	// SuccessHandler is an optional hook invoked after authentication succeeds and
 	// context values are set, right before calling c.Next(). If SuccessHandler
-	// aborts the context (for example, to enforce per-key rate limits), downstream
+	// aborts the context (for example, to enforce custom checks), downstream
 	// handlers are not executed.
 	SuccessHandler func(c *gin.Context, info *KeyInfo)
+
+	// RateLimit optionally configures per-API-key rate limiting enforced immediately
+	// after authentication (respecting per-key overrides on [KeyInfo.RateLimit]).
+	// Throttled requests receive 429 Too Many Requests with standard X-RateLimit-*
+	// and Retry-After headers.
+	RateLimit *RateLimitConfig
 
 	// UsageRecorder is an optional metering sink invoked after request handling
 	// completes for every authenticated API key request. Use [NewMemoryUsageAggregator]
@@ -249,6 +255,11 @@ func New(cfg Config) gin.HandlerFunc {
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = DefaultErrorHandler
 	}
+	var rateLimitCheck func(c *gin.Context, info *KeyInfo) bool
+	if cfg.RateLimit != nil {
+		rlCopy := *cfg.RateLimit
+		rateLimitCheck = buildRateLimitEvaluator(rlCopy, cfg.Now)
+	}
 
 	fail := func(c *gin.Context, err error) {
 		if c.Writer.Header().Get("WWW-Authenticate") == "" {
@@ -267,6 +278,7 @@ func New(cfg Config) gin.HandlerFunc {
 		respBytes := max(int64(c.Writer.Size()), 0)
 
 		units := int64(1)
+		routePattern := c.FullPath()
 		var (
 			billable    bool
 			billableSet bool
@@ -277,6 +289,12 @@ func New(cfg Config) gin.HandlerFunc {
 				units = st.units
 				billable = st.billable
 				billableSet = st.billableSet
+				if st.requestBytes > reqBytes {
+					reqBytes = st.requestBytes
+				}
+				if st.routeOverride != "" {
+					routePattern = st.routeOverride
+				}
 				if len(st.attributes) > 0 {
 					attrs = maps.Clone(st.attributes)
 				}
@@ -297,7 +315,7 @@ func New(cfg Config) gin.HandlerFunc {
 			KeyName:       info.Name,
 			KeyMetadata:   keyMeta,
 			Method:        c.Request.Method,
-			Route:         c.FullPath(),
+			Route:         routePattern,
 			Path:          c.Request.URL.Path,
 			StatusCode:    statusCode,
 			Latency:       latency,
@@ -352,6 +370,13 @@ func New(cfg Config) gin.HandlerFunc {
 			if cfg.RawKeyContextKey != DefaultRawKeyContextKey {
 				c.Set(activeRawKeyContextKey, cfg.RawKeyContextKey)
 			}
+		}
+
+		if rateLimitCheck != nil && !rateLimitCheck(c, info) {
+			if cfg.UsageRecorder != nil {
+				recordUsage(c, info, start)
+			}
+			return
 		}
 
 		if cfg.SuccessHandler != nil {

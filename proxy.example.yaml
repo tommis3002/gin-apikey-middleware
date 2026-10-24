@@ -1,0 +1,72 @@
+server:
+  listen: ":8080"
+  mode: "release"
+  read_timeout: "30s"
+  write_timeout: "60s"
+  shutdown_timeout: "15s"
+  health_path: "/healthz"
+
+auth:
+  header: "X-API-Key"
+  allow_bearer: true
+  query_param: "api_key"
+  realm: "API-Gateway"
+  api_keys:
+    "sk_live_admin_987654321":
+      id: "admin-01"
+      name: "Platform Admin"
+      roles: ["admin"]
+      scopes: ["read", "write", "ocr:execute"]
+      rate_limit:
+        unlimited: true
+
+    "sk_live_client_123456789":
+      id: "cust-acme"
+      name: "Acme Corp Production"
+      roles: ["customer"]
+      scopes: ["read", "ocr:execute"]
+      metadata:
+        customer_id: "cus_acme_001"
+        plan: "pro"
+      rate_limit:
+        requests_per_second: 50
+        burst: 100
+      expires_at: "2027-12-31T23:59:59Z"
+
+  # Generate hashed keys via: go run ./cmd/apikey-proxy -hash-key "my-secret"
+  hashed_api_keys:
+    "sha256:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b":
+      id: "svc-partner"
+      name: "Hashed Partner Key (raw: 'secret')"
+      roles: ["partner"]
+      scopes: ["read"]
+
+rate_limit:
+  enabled: true
+  requests_per_second: 10
+  burst: 20
+
+invoicing:
+  enabled: true
+  jsonl_file: "./usage-records.jsonl"
+  batch_size: 100
+  flush_interval: "5s"
+  block_when_full: true
+  admin_endpoints_enabled: true
+  admin_usage_path: "/__admin/usage"
+  admin_required_role: "admin"
+
+routes:
+  - prefix: "/v1/ocr"
+    target: "http://127.0.0.1:9001"
+    strip_prefix: "/v1/ocr"
+    required_scopes: ["ocr:execute"]
+    metadata_headers:
+      customer_id: "X-Customer-ID"
+      plan: "X-Customer-Plan"
+
+  - prefix: "/"
+    target: "http://127.0.0.1:9000"
+    required_scopes: ["read"]
+    metadata_headers:
+      customer_id: "X-Customer-ID"

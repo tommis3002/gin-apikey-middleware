@@ -46,6 +46,21 @@ var (
 	ErrMissingKey = errors.New("missing api key")
 )
 
+// KeyRateLimit defines optional per-key rate-limiting overrides attached to a [KeyInfo].
+type KeyRateLimit struct {
+	// RequestsPerSecond sets the sustained token refill rate in requests per second.
+	// Ignored when Unlimited is true.
+	RequestsPerSecond float64 `json:"requests_per_second,omitempty" yaml:"requests_per_second,omitempty"`
+
+	// Burst sets the maximum burst capacity in tokens. When <= 0 and RequestsPerSecond > 0,
+	// defaults to max(ceil(RequestsPerSecond), 1).
+	Burst int `json:"burst,omitempty" yaml:"burst,omitempty"`
+
+	// Unlimited exempts this API key from rate limiting when true (for example,
+	// internal system or admin keys).
+	Unlimited bool `json:"unlimited,omitempty" yaml:"unlimited,omitempty"`
+}
+
 // KeyInfo holds identity, authorization, and lifecycle metadata associated with
 // an authenticated API key.
 //
@@ -70,6 +85,10 @@ type KeyInfo struct {
 	// rate-limit tier, or environment).
 	Metadata map[string]any `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 
+	// RateLimit optionally overrides the default [RateLimitConfig] rate and burst
+	// for this specific API key.
+	RateLimit *KeyRateLimit `json:"rate_limit,omitempty" yaml:"rate_limit,omitempty"`
+
 	// ExpiresAt is an optional UTC timestamp after which the key is rejected with
 	// [ErrKeyExpired]. When nil, the key does not expire.
 	ExpiresAt *time.Time `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
@@ -80,7 +99,7 @@ type KeyInfo struct {
 }
 
 // Clone returns a copy of k with shallow-cloned Roles, Scopes, and Metadata
-// containers and an independent ExpiresAt value. It returns nil if k is nil.
+// containers and independent RateLimit and ExpiresAt values. It returns nil if k is nil.
 func (k *KeyInfo) Clone() *KeyInfo {
 	if k == nil {
 		return nil
@@ -94,6 +113,10 @@ func (k *KeyInfo) Clone() *KeyInfo {
 	}
 	if k.Metadata != nil {
 		cp.Metadata = maps.Clone(k.Metadata)
+	}
+	if k.RateLimit != nil {
+		rl := *k.RateLimit
+		cp.RateLimit = &rl
 	}
 	if k.ExpiresAt != nil {
 		exp := *k.ExpiresAt

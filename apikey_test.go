@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -730,6 +732,7 @@ func TestPanicsAndConfigStructTags(t *testing.T) {
 			"Roles":     "roles,omitempty",
 			"Scopes":    "scopes,omitempty",
 			"Metadata":  "metadata,omitempty",
+			"RateLimit": "rate_limit,omitempty",
 			"ExpiresAt": "expires_at,omitempty",
 			"Disabled":  "disabled,omitempty",
 		}
@@ -1174,6 +1177,227 @@ func TestAsyncUsageRecorderBatchingFlushOverflowAndShutdown(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || middlewareUsageErr == nil {
 		t.Fatalf("expected 200 OK response and UsageErrorHandler called, code=%d err=%v", w.Code, middlewareUsageErr)
+	}
+}
+
+func TestRateLimiterMiddlewareAndKeyOverrides(t *testing.T) {
+	var nowNano atomic.Int64
+	baseTime := time.Date(2026, 10, 24, 18, 0, 0, 0, time.UTC)
+	nowNano.Store(baseTime.UnixNano())
+	clock := func() time.Time { return time.Unix(0, nowNano.Load()) }
+
+	limiter := apikey.NewMemoryRateLimiterWithConfig(apikey.MemoryRateLimiterConfig{
+		MaxBuckets: 10,
+		IdleTTL:    time.Minute,
+		Now:        clock,
+	})
+	aggregator := apikey.NewMemoryUsageAggregator()
+
+	store := apikey.NewMemoryStore(map[string]*apikey.KeyInfo{
+		"default-tier": {ID: "cust-default"},
+		"vip-tier": {
+			ID: "cust-vip",
+			RateLimit: &apikey.KeyRateLimit{
+				RequestsPerSecond: 100,
+				Burst:             5,
+			},
+		},
+		"admin-tier": {
+			ID:        "cust-admin",
+			RateLimit: &apikey.KeyRateLimit{Unlimited: true},
+		},
+	})
+
+	r := gin.New()
+	r.Use(apikey.New(apikey.Config{
+		Store:         store,
+		UsageRecorder: aggregator,
+		Now:           clock,
+		RateLimit: &apikey.RateLimitConfig{
+			Limiter:           limiter,
+			RequestsPerSecond: 1,
+			Burst:             2,
+		},
+	}))
+
+	// Endpoint with stricter route-level RateLimit ignoring key tier
+	r.POST("/expensive", apikey.RateLimit(apikey.RateLimitConfig{
+		Limiter:            limiter,
+		RequestsPerSecond:  1,
+		Burst:              1,
+		IgnoreKeyRateLimit: true,
+		KeyFunc: func(c *gin.Context, info *apikey.KeyInfo) string {
+			return info.ID + ":expensive"
+		},
+	}), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	r.GET("/data", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	doGet := func(key string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(http.MethodGet, "/data", nil)
+		req.Header.Set("X-API-Key", key)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	// Default tier: burst=2 -> first 2 pass, 3rd returns 429 with Retry-After
+	if w := doGet("default-tier"); w.Code != http.StatusOK || w.Header().Get("X-RateLimit-Remaining") != "1" {
+		t.Fatalf("expected 200 and remaining=1, got code=%d rem=%q", w.Code, w.Header().Get("X-RateLimit-Remaining"))
+	}
+	if w := doGet("default-tier"); w.Code != http.StatusOK || w.Header().Get("X-RateLimit-Remaining") != "0" {
+		t.Fatalf("expected 200 and remaining=0, got code=%d rem=%q", w.Code, w.Header().Get("X-RateLimit-Remaining"))
+	}
+	w429 := doGet("default-tier")
+	if w429.Code != http.StatusTooManyRequests || w429.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected 429 with Retry-After, got code=%d hdr=%q", w429.Code, w429.Header().Get("Retry-After"))
+	}
+
+	// Advance clock by 1s -> 1 token refilled -> succeeds again
+	nowNano.Store(baseTime.Add(time.Second).UnixNano())
+	if w := doGet("default-tier"); w.Code != http.StatusOK {
+		t.Fatalf("expected 200 after 1s token refill, got %d", w.Code)
+	}
+
+	// Verify 429 was recorded as non-billable in UsageSummary
+	sum, _ := aggregator.Summary("cust-default")
+	if sum.BillableRequests != 3 || sum.TotalRequests != 4 || sum.ByStatus[429] != 1 {
+		t.Fatalf("unexpected usage summary after rate limiting: %+v", sum)
+	}
+
+	// Unlimited admin tier never throttled
+	for i := 0; i < 10; i++ {
+		if w := doGet("admin-tier"); w.Code != http.StatusOK {
+			t.Fatalf("admin unlimited key throttled on iter %d: %d", i, w.Code)
+		}
+	}
+
+	// Expensive route enforces Burst=1 even on VIP key (IgnoreKeyRateLimit=true)
+	for attempt, want := range []int{http.StatusOK, http.StatusTooManyRequests} {
+		req, _ := http.NewRequest(http.MethodPost, "/expensive", nil)
+		req.Header.Set("X-API-Key", "vip-tier")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != want {
+			t.Fatalf("expensive attempt %d: expected %d, got %d", attempt+1, want, w.Code)
+		}
+	}
+
+	// Bounded MaxBuckets eviction check + Reset + Purge
+	for i := 0; i < 50; i++ {
+		_, _ = limiter.Allow(context.Background(), fmt.Sprintf("bucket-%d", i), apikey.RateLimitPolicy{
+			RequestsPerSecond: 5,
+			Burst:             5,
+		})
+		if limiter.Len() > 10 {
+			t.Fatalf("expected MaxBuckets<=10, got %d", limiter.Len())
+		}
+	}
+	limiter.Reset("bucket-49")
+	limiter.Purge()
+	if limiter.Len() != 0 {
+		t.Fatalf("expected Len()==0 after Purge, got %d", limiter.Len())
+	}
+}
+
+func TestReverseProxyHelperAndChunkedInvoicing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("X-Usage-Units", "9")
+		w.Header().Set("X-Usage-SKU", "proxy-sku")
+		if r.URL.Query().Get("free") == "1" {
+			w.Header().Set("X-Usage-Billable", "false")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"path":      r.URL.Path,
+			"query":     r.URL.RawQuery,
+			"api_key":   r.Header.Get("X-API-Key"),
+			"key_id":    r.Header.Get("X-API-Key-ID"),
+			"roles":     r.Header.Get("X-API-Key-Roles"),
+			"tenant_id": r.Header.Get("X-Tenant-ID"),
+			"svc_token": r.Header.Get("X-Internal-Token"),
+			"body_len":  len(body),
+		})
+	}))
+	defer upstream.Close()
+
+	aggregator := apikey.NewMemoryUsageAggregator()
+	store := apikey.NewMemoryStore(map[string]*apikey.KeyInfo{
+		"proxy-secret": {
+			ID:       "key-proxy-1",
+			Name:     "Edge Client",
+			Roles:    []string{"reader", "writer"},
+			Metadata: map[string]any{"tenant_id": "ten_42"},
+		},
+	})
+
+	proxyHandler := apikey.MustNewReverseProxy(apikey.ProxyConfig{
+		Target:                upstream.URL,
+		StripPrefix:           "/edge",
+		CredentialQueryParams: []string{"api_key"},
+		CredentialCookies:     []string{"api_cookie"},
+		MetadataHeaders:       map[string]string{"tenant_id": "X-Tenant-ID"},
+		UpstreamHeaders:       map[string]string{"X-Internal-Token": "internal-xyz"},
+	})
+
+	r := gin.New()
+	r.Use(apikey.New(apikey.Config{
+		Store: store,
+		Extractor: apikey.FromFirstOf(
+			apikey.FromHeader("X-API-Key"),
+			apikey.FromQuery("api_key"),
+		),
+		UsageRecorder: aggregator,
+	}))
+	r.Any("/edge/*rest", proxyHandler)
+
+	// Send chunked request (ContentLength = -1) with spoofed X-Tenant-ID and ?api_key=...
+	payload := "streamed-chunked-payload-data"
+	req, _ := http.NewRequest(http.MethodPost, "/edge/v2/process?api_key=proxy-secret&keep=yes", io.NopCloser(strings.NewReader(payload)))
+	req.ContentLength = -1
+	req.Header.Set("X-Tenant-ID", "evil-spoofed-tenant")
+	req.AddCookie(&http.Cookie{Name: "api_cookie", Value: "secret-cookie"})
+	req.AddCookie(&http.Cookie{Name: "other", Value: "ok"})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from reverse proxy, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var got map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got["path"] != "/v2/process" || got["query"] != "keep=yes" {
+		t.Errorf("unexpected rewritten path/query: %+v", got)
+	}
+	if got["api_key"] != "" {
+		t.Errorf("expected X-API-Key to be stripped, got %v", got["api_key"])
+	}
+	if got["key_id"] != "key-proxy-1" || got["tenant_id"] != "ten_42" || got["svc_token"] != "internal-xyz" {
+		t.Errorf("unexpected forwarded identity/metadata headers: %+v", got)
+	}
+
+	// Verify chunked RequestBytes (29 bytes) and upstream X-Usage-Units (9) recorded in invoicing!
+	sum, _ := aggregator.Summary("key-proxy-1")
+	if sum.BillableUnits != 9 || sum.RequestBytes != int64(len(payload)) {
+		t.Fatalf("expected BillableUnits=9 and RequestBytes=%d, got %+v", len(payload), sum)
+	}
+
+	// Dead upstream returns 502 Bad Gateway (non-billable)
+	badProxy := apikey.MustNewReverseProxy(apikey.ProxyConfig{
+		Target: "http://127.0.0.1:1",
+	})
+	r.GET("/dead", badProxy)
+	reqDead, _ := http.NewRequest(http.MethodGet, "/dead", nil)
+	reqDead.Header.Set("X-API-Key", "proxy-secret")
+	wDead := httptest.NewRecorder()
+	r.ServeHTTP(wDead, reqDead)
+	if wDead.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway on unreachable upstream, got %d", wDead.Code)
 	}
 }
 

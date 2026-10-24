@@ -157,7 +157,30 @@ type requestUsageState struct {
 	unitsCustomized bool
 	billable        bool
 	billableSet     bool
+	requestBytes    int64
+	routeOverride   string
 	attributes      map[string]any
+}
+
+func recordStreamedRequestBytes(c *gin.Context, n int64) {
+	if n <= 0 {
+		return
+	}
+	st := getOrCreateUsageState(c)
+	if n > st.requestBytes {
+		st.requestBytes = n
+	}
+}
+
+// SetUsageRoute overrides [UsageRecord.Route] for the current request.
+//
+// This is particularly useful in catch-all or reverse-proxy handlers (such as
+// gin.Engine.NoRoute) where c.FullPath() is empty or overly broad, allowing
+// [MemoryUsageAggregator] and invoicing pipelines to group traffic under a clean,
+// low-cardinality route prefix (for example, "/v1/ocr").
+func SetUsageRoute(c *gin.Context, route string) {
+	st := getOrCreateUsageState(c)
+	st.routeOverride = route
 }
 
 func getOrCreateUsageState(c *gin.Context) *requestUsageState {

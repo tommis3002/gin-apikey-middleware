@@ -11,7 +11,9 @@ A flexible, production-ready API key authentication, RBAC authorization, and usa
 - 📥 **Flexible Extraction**: Extract API keys from custom headers (`X-API-Key`), Authorization Bearer tokens (`Authorization: Bearer <key>`), query parameters (`?api_key=...`), cookies (`FromCookie`), or fallback chains (`FromFirstOf`).
 - 👥 **Role-Based & Scope-Based Authorization**: Built-in guards `RequireRole`, `RequireAnyRole`, `RequireAllRoles`, `RequireScope`, `RequireAnyScope`, and `RequireAllScopes`.
 - ⏳ **Expiration & Revocation**: Consistent enforcement of `ExpiresAt` and `Disabled` across both in-memory and custom external stores.
+- 🚦 **Per-Key Rate Limiting**: Built-in bounded token-bucket limiter (`MemoryRateLimiter`) and Redis-ready `RateLimiter` interface with per-key tier overrides (`KeyInfo.RateLimit`), `X-RateLimit-*` / `Retry-After` headers, and per-route `RateLimit` guards.
 - 💳 **Invoicing & Usage Metering**: Capture post-response `UsageRecord` events (units, status, latency, request/response bytes, route SKU patterns, customer metadata) with built-in atomic billing-window aggregation (`MemoryUsageAggregator`) and async batch persistence (`AsyncUsageRecorder`).
+- 🌐 **Reverse Proxy & Standalone Gateway**: Turn any backend into an authenticated, rate-limited, metered API using `NewReverseProxy` or the ready-to-run `cmd/apikey-proxy` YAML/JSON gateway binary.
 - ⚙️ **Customizable**: Custom error handlers (receiving raw backend errors for logging/metrics while `DefaultErrorHandler` prevents key enumeration), `SuccessHandler` hooks, `WWW-Authenticate` realm headers, route skipping, and optional raw-key context redaction.
 
 ---
@@ -453,6 +455,100 @@ r.Use(apikey.New(apikey.Config{
 
 ---
 
+## Per-Key Rate Limiting
+
+Configure default per-key token-bucket limits on `Config.RateLimit` and optionally override `rate_limit` per key in `KeyInfo` (JSON/YAML/DB). Responses emit `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on `429 Too Many Requests` (automatically marked `Billable: false` for invoicing).
+
+```go
+store := apikey.NewMemoryStore(map[string]*apikey.KeyInfo{
+	"sk_free_user": {ID: "free-1"}, // uses global default (10 rps, burst 20)
+	"sk_pro_user": {
+		ID: "pro-1",
+		RateLimit: &apikey.KeyRateLimit{
+			RequestsPerSecond: 200,
+			Burst:             400,
+		},
+	},
+	"sk_internal_admin": {
+		ID:        "admin-1",
+		RateLimit: &apikey.KeyRateLimit{Unlimited: true},
+	},
+})
+
+r.Use(apikey.New(apikey.Config{
+	Store: store,
+	RateLimit: &apikey.RateLimitConfig{
+		RequestsPerSecond: 10,
+		Burst:             20,
+	},
+}))
+
+// Apply an additional stricter endpoint-specific limit onto an expensive route:
+r.POST("/v1/heavy-export", apikey.RateLimit(apikey.RateLimitConfig{
+	RequestsPerSecond:  0.5, // 1 request every 2 seconds
+	Burst:              2,
+	IgnoreKeyRateLimit: true,
+	KeyFunc: func(c *gin.Context, info *apikey.KeyInfo) string {
+		return info.ID + ":heavy-export"
+	},
+}), handleHeavyExport)
+```
+
+For multi-instance deployments, implement the single-method `RateLimiter` interface (or `RateLimiterFunc`) backed by Redis and pass it to `RateLimitConfig.Limiter`.
+
+---
+
+## Reverse Proxy & Standalone API Gateway
+
+### 1. Library Reverse Proxy Helper (`NewReverseProxy`)
+
+Place Gin in front of any internal HTTP/HTTPS service with `NewReverseProxy`:
+- Strips external `X-API-Key` / `Authorization` headers, query params, and cookies before forwarding.
+- Prevents header spoofing and injects verified `X-API-Key-ID`, `X-API-Key-Name`, `X-API-Key-Roles`, `X-API-Key-Scopes`, and mapped `KeyInfo.Metadata` headers (e.g. `X-Customer-ID`).
+- Counts chunked streaming request bytes (`ContentLength == -1`) and extracts optional upstream invoicing headers (`X-Usage-Units`, `X-Usage-Billable`, `X-Usage-SKU`), stripping them before returning the response to clients.
+
+```go
+proxyHandler, err := apikey.NewReverseProxy(apikey.ProxyConfig{
+	Target:      "http://127.0.0.1:9001",
+	StripPrefix: "/v1/ocr",
+	MetadataHeaders: map[string]string{
+		"customer_id": "X-Customer-ID",
+		"plan":        "X-Customer-Plan",
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+r.Use(apikey.New(apikey.Config{
+	Store:         store,
+	UsageRecorder: aggregator,
+	RateLimit:     &apikey.RateLimitConfig{RequestsPerSecond: 25, Burst: 50},
+}))
+
+r.Any("/v1/ocr/*path", proxyHandler)
+```
+
+### 2. Standalone Configurable Gateway Binary (`cmd/apikey-proxy`)
+
+Run a zero-code authenticating, rate-limiting, and usage-metering reverse proxy configured via YAML or JSON (see [`proxy.example.yaml`](proxy.example.yaml)):
+
+```bash
+# Generate a SHA-256 key hash for hashed_api_keys in your config:
+go run ./cmd/apikey-proxy -hash-key "my-raw-api-key"
+
+# Start the gateway proxy:
+go run ./cmd/apikey-proxy -config proxy.example.yaml
+
+# Or build a standalone binary:
+go build -o apikey-proxy ./cmd/apikey-proxy
+./apikey-proxy -config proxy.example.yaml
+```
+
+When `invoicing.admin_endpoints_enabled: true` is configured, admin keys can inspect live usage (`GET /__admin/usage`) or atomically flush billing windows (`POST /__admin/usage/flush`), alongside streaming JSON Lines records to `invoicing.jsonl_file`.
+
+---
+
 ## Configuration Reference
 
 ### `apikey.Config`
@@ -467,11 +563,42 @@ r.Use(apikey.New(apikey.Config{
 | `Realm` | `string` | `"API"` | Realm value sent in `WWW-Authenticate: ApiKey realm="..."` on `401` responses. |
 | `Skipper` | `func(*gin.Context) bool` | `nil` | Skips authentication when returning `true` (e.g., `/health`, `/metrics`). |
 | `ErrorHandler` | `func(*gin.Context, error)` | `DefaultErrorHandler` | Receives underlying auth or datastore error; middleware guarantees `c.Abort()` afterward. |
-| `SuccessHandler` | `func(*gin.Context, *KeyInfo)` | `nil` | Pre-handler hook invoked after authentication succeeds (may call `c.Abort...` for rate-limiting). |
+| `SuccessHandler` | `func(*gin.Context, *KeyInfo)` | `nil` | Pre-handler hook invoked after authentication and rate limiting succeed. |
+| `RateLimit` | `*RateLimitConfig` | `nil` | Optional per-API-key token-bucket rate-limiting configuration. |
 | `UsageRecorder` | `UsageRecorder` | `nil` | Post-response usage metering sink for invoicing and analytics. |
 | `BillableFilter` | `func(*gin.Context, *KeyInfo, int) bool` | `DefaultBillableFilter` | Determines `UsageRecord.Billable` (`200 <= status < 400` by default) unless `SetBillable` was called. |
 | `UsageErrorHandler` | `func(*gin.Context, UsageRecord, error)` | `nil` | Invoked if `UsageRecorder.RecordUsage` returns an error. |
-| `Now` | `func() time.Time` | `time.Now` | Clock source for `KeyInfo.ExpiresAt` validation and `UsageRecord.Timestamp`. |
+| `Now` | `func() time.Time` | `time.Now` | Clock source for `KeyInfo.ExpiresAt` validation, rate limiting, and `UsageRecord.Timestamp`. |
+
+### `apikey.RateLimitConfig`
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `Limiter` | `RateLimiter` | `NewMemoryRateLimiter()` | Backing limiter (`MemoryRateLimiter` or custom distributed Redis `RateLimiter`). |
+| `RequestsPerSecond` | `float64` | `0` (disabled) | Default sustained token refill rate when `KeyInfo.RateLimit` is nil. |
+| `Burst` | `int` | `max(ceil(RPS), 1)` | Default maximum burst size in tokens. |
+| `IgnoreKeyRateLimit` | `bool` | `false` | Ignores `KeyInfo.RateLimit` overrides when `true` (useful for uniform per-route limits). |
+| `PolicyFunc` | `func(*gin.Context, *KeyInfo) RateLimitPolicy` | `nil` | Dynamically computes policy per request. |
+| `KeyFunc` | `func(*gin.Context, *KeyInfo) string` | `info.ID` | Bucket key builder (override to scope by `info.ID + ":" + c.FullPath()`). |
+| `DisableHeaders` | `bool` | `false` | Suppresses `X-RateLimit-*` headers when `true`. |
+| `ErrorHandler` | `func(*gin.Context, RateLimitDecision, error)` | `DefaultRateLimitErrorHandler` | Customizes `429` or limiter-failure responses. |
+
+### `apikey.ProxyConfig`
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `Target` / `TargetURL` | `string` / `*url.URL` | **Required** | Upstream HTTP/HTTPS target URL. |
+| `StripPrefix` | `string` | `""` | Leading URL path prefix stripped before forwarding upstream. |
+| `PreserveHost` | `bool` | `false` | Keeps incoming `Host` header instead of upstream URL host when `true`. |
+| `PreserveClientCredentials` | `bool` | `false` | Strips `CredentialHeaders` (`X-API-Key`, `Authorization`), query params, and cookies when `false`. |
+| `DisableIdentityHeaders` | `bool` | `false` | Injects spoof-safe `X-API-Key-ID`, `Name`, `Roles`, `Scopes` headers when `false`. |
+| `MetadataHeaders` | `map[string]string` | `nil` | Maps `KeyInfo.Metadata` keys to upstream headers (e.g., `customer_id -> X-Customer-ID`). |
+| `UpstreamHeaders` | `map[string]string` | `nil` | Static headers added to every upstream request. |
+| `UpstreamUnitsHeader` | `string` | `"X-Usage-Units"` | Upstream response header parsed into `SetUsageUnits` and stripped from client response. |
+| `UpstreamBillableHeader` | `string` | `"X-Usage-Billable"` | Upstream response header parsed into `SetBillable` and stripped from client response. |
+| `UpstreamSKUHeader` | `string` | `"X-Usage-SKU"` | Upstream response header recorded under `Attributes["sku"]` and stripped from client response. |
+| `FlushInterval` | `time.Duration` | `0` | Streaming response flush interval (`-1` for immediate SSE/streaming flushing). |
+| `ErrorHandler` | `func(*gin.Context, error)` | `DefaultProxyErrorHandler` | Handles upstream connection errors (`502 Bad Gateway` by default). |
 
 ### `apikey.CachedStoreConfig`
 
@@ -506,6 +633,7 @@ r.Use(apikey.New(apikey.Config{
 | `ErrKeyNotFound` | Key does not exist in the `Store`. |
 | `ErrKeyDisabled` | Key has `Disabled: true`. |
 | `ErrKeyExpired` | Key's `ExpiresAt` timestamp has passed. |
+| `ErrRateLimitExceeded` | Authenticated key has exceeded its configured `RateLimitPolicy`. |
 | `ErrUsageBufferFull` | `AsyncUsageRecorder` buffer is full (`BlockWhenFull: false`). |
 | `ErrUsageRecorderClosed` | `AsyncUsageRecorder.RecordUsage` called after `Shutdown`. |
 
